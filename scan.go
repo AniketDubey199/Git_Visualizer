@@ -18,7 +18,7 @@ func getDotFilePath() string {
 		log.Fatal(err)
 	}
 
-	dotFile := usr.HomeDir + "./gogitlocalstats"
+	dotFile := usr.HomeDir + "/.gogitlocalstats"
 
 	return dotFile
 }
