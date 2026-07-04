@@ -5,13 +5,13 @@ import (
 	"sort"
 	"time"
 
-	"gopkg.in/src-d/go-git.v4"
-	"gopkg.in/src-d/go-git.v4/plumbing/object"
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 const outofRange = 99999
-const daysInLastSixMonth = 183
-const weeksInLastSixMonth = 93
+const daysInLastSixMonths = 183
+const weeksInLastSixMonths = 26
 
 type column []int
 
@@ -36,7 +36,7 @@ func countDaysSinceDate(date time.Time) int {
 	for date.Before(now) {
 		date = date.Add(time.Hour * 24)
 		days++
-		if days > daysInLastSixMonth {
+		if days > daysInLastSixMonths {
 			return outofRange
 		}
 	}
@@ -48,30 +48,35 @@ func countDaysSinceDate(date time.Time) int {
 func fillCommits(email string, path string, commits map[int]int) map[int]int {
 	repo, err := git.PlainOpen(path)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Skipping %s: %v\n", path, err)
+		return commits
 	}
 
 	ref, err := repo.Head()
 	if err != nil {
-		panic(err)
+		fmt.Printf("Skipping %s: %v\n", path, err)
+		return commits
 	}
 
 	iterator, err := repo.Log(&git.LogOptions{From: ref.Hash()})
 	if err != nil {
-		panic(err)
+		fmt.Printf("Skipping %s: %v\n", path, err)
+		return commits
 	}
 
-	offset := calcOffest()
+	offset := calcOffset()
 	err = iterator.ForEach(func(c *object.Commit) error {
-		daysalgo := countDaysSinceDate(c.Author.When) + offset
-
 		if c.Author.Email != email {
 			return nil
 		}
+		days := countDaysSinceDate(c.Author.When)
 
-		if daysalgo != outofRange {
-			commits[daysalgo]++
+		if days == outofRange {
+			return nil
 		}
+
+		days += offset
+		commits[days]++
 		return nil
 	})
 	if err != nil {
@@ -86,7 +91,7 @@ func processRepositories(email string) map[int]int {
 	filePath := getDotFilePath()
 	repos := parseFileToSlice(filePath)
 
-	daysInMap := daysInLastSixMonth
+	daysInMap := daysInLastSixMonths
 
 	commits := make(map[int]int, daysInMap)
 	for i := daysInMap; i > 0; i-- {
@@ -94,6 +99,8 @@ func processRepositories(email string) map[int]int {
 	}
 
 	for _, path := range repos {
+		fmt.Println("Opening:", path)
+
 		commits = fillCommits(email, path, commits)
 	}
 
@@ -101,7 +108,7 @@ func processRepositories(email string) map[int]int {
 }
 
 // determines and returns the amount of days missing to fill last row of the stats groph
-func calcOffest() int {
+func calcOffset() int {
 	var offset int
 	weekdays := time.Now().Weekday()
 
@@ -143,11 +150,11 @@ func printCell(val int, today bool) {
 	}
 
 	if val == 0 {
-		fmt.Printf(escape + " - " + "\033[0m")
+		fmt.Printf(escape + "  - " + "\033[0m")
 		return
 	}
 
-	str := " %d "
+	str := "  %d "
 	switch {
 	case val >= 10:
 		str = " %d "
@@ -156,7 +163,6 @@ func printCell(val int, today bool) {
 	}
 
 	fmt.Printf(escape+str+"\033[0m", val)
-
 }
 
 // prints commit stats
@@ -183,32 +189,34 @@ func buildCols(keys []int, commits map[int]int) map[int]column {
 	col := column{}
 
 	for _, k := range keys {
-		week := int(k / 7)
-		dayinweek := k % 7
+		week := int(k / 7) //26,25...1
+		dayinweek := k % 7 // 0,1,2,3,4,5,6
 
-		if dayinweek == 0 {
+		if dayinweek == 0 { //reset
 			col = column{}
 		}
+
 		col = append(col, commits[k])
 
 		if dayinweek == 6 {
 			cols[week] = col
 		}
 	}
+
 	return cols
 }
 
 // print cells of the graph
 func printCells(cols map[int]column) {
 	printMonths()
-
 	for j := 6; j >= 0; j-- {
-		for i := weeksInLastSixMonth + 1; i >= 0; i-- {
-			if i == weeksInLastSixMonth+1 {
+		for i := weeksInLastSixMonths + 1; i >= 0; i-- {
+			if i == weeksInLastSixMonths+1 {
 				printDayCol(j)
 			}
 			if col, ok := cols[i]; ok {
-				if i == 0 && j == calcOffest()-1 {
+				//special case today
+				if i == 0 && j == calcOffset()-1 {
 					printCell(col[j], true)
 					continue
 				} else {
@@ -226,34 +234,43 @@ func printCells(cols map[int]column) {
 
 // prints the month name in first line
 func printMonths() {
-	week := getBeginningOfTheDay(time.Now()).Add(-(daysInLastSixMonth * time.Hour * 24))
+	week := getBeginningOfTheDay(time.Now()).Add(-(daysInLastSixMonths * time.Hour * 24))
 	month := week.Month()
 	fmt.Printf("	")
 	for {
 		if week.Month() != month {
 			fmt.Printf("%s ", week.Month().String()[:3])
+			month = week.Month()
 		} else {
-			fmt.Printf("	")
+			fmt.Printf("    ")
 		}
+
 		week = week.Add(7 * time.Hour * 24)
 		if week.After(time.Now()) {
 			break
 		}
 	}
-
-	fmt.Printf("/n")
+	fmt.Printf("\n")
 }
 
 // given the day number print the day name
 func printDayCol(day int) {
 	out := "	"
 	switch day {
+	case 0:
+		out = " Sun "
 	case 1:
 		out = " Mon "
+	case 2:
+		out = " Tue "
 	case 3:
 		out = " Wed "
+	case 4:
+		out = " Thu "
 	case 5:
 		out = " Fri "
+	case 6:
+		out = " Sat "
 	}
 
 	fmt.Printf(out)

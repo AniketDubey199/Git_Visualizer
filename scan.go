@@ -26,17 +26,9 @@ func getDotFilePath() string {
 // opens a file by finding its directory , if not present then creates the file
 
 func openFile(filePath string) *os.File {
-	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_RDWR, 0755)
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		if os.IsNotExist(err) {
-			_, err := os.Create(filePath)
-			if err != nil {
-				panic(err)
-			}
-		} else {
-			panic(err)
-		}
-
+		panic(err)
 	}
 	return f
 }
@@ -126,16 +118,24 @@ func scanGitFolder(folders []string, folder string) []string {
 
 	for _, file := range files {
 		if file.IsDir() {
-			path = folder + "/" + file.Name()
-			if file.Name() == ".git" {
-				path = strings.TrimSuffix(path, "./git")
-				fmt.Println(path)
-				folders = append(folders, path)
+
+			if strings.HasPrefix(file.Name(), ".") && file.Name() != ".git" {
 				continue
 			}
+
+			path = folder + "/" + file.Name()
+
+			if file.Name() == ".git" {
+				repo := strings.TrimSuffix(path, "/.git")
+				fmt.Println(repo)
+				folders = append(folders, repo)
+				continue
+			}
+
 			if file.Name() == "vendor" || file.Name() == "node_modules" {
 				continue
 			}
+
 			folders = scanGitFolder(folders, path)
 		}
 	}
