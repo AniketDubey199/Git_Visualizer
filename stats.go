@@ -2,7 +2,10 @@ package main
 
 import (
 	"fmt"
-	"sort"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -13,265 +16,205 @@ const outofRange = 99999
 const daysInLastSixMonths = 183
 const weeksInLastSixMonths = 26
 
-type column []int
-
-func stats(email string) {
-	commits := processRepositories(email)
-	printCommitStats(commits)
+// RepoResult stores the processed commit histogram and error for a single repository.
+type RepoResult struct {
+	RepoPath string
+	Commits  map[int]int
+	Total    int
+	Err      error
 }
 
-// gives the start time of the day
-func getBeginningOfTheDay(t time.Time) time.Time {
-	year, month, date := t.Date()
-	startOfDay := time.Date(year, month, date, 0, 0, 0, 0, t.Location())
-
-	return startOfDay
-}
-
-// gives the beginning of the day
-func countDaysSinceDate(date time.Time) int {
-	days := 0
-	now := getBeginningOfTheDay(time.Now())
-
-	for date.Before(now) {
-		date = date.Add(time.Hour * 24)
-		days++
-		if days > daysInLastSixMonths {
-			return outofRange
+// parseEmails splits comma-separated emails and converts them to a lowercase lookup set.
+func parseEmails(emailStr string) map[string]struct{} {
+	parts := strings.Split(emailStr, ",")
+	set := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		cleaned := strings.ToLower(strings.TrimSpace(p))
+		if cleaned != "" {
+			set[cleaned] = struct{}{}
 		}
 	}
-	return days
+	return set
 }
 
-// from the given repo found in 'path' , gets the commit and puts them in the
-// 'commits' map , returning it when completed
-func fillCommits(email string, path string, commits map[int]int) map[int]int {
-	repo, err := git.PlainOpen(path)
+// fillCommits inspects a single repository and populates a thread-local commits map.
+// Crucially:
+// 1. It returns an error instead of calling panic(err).
+// 2. It accepts emailSet for multi-email matching.
+// 3. It uses O(1) DST-safe date calculation (countDaysSinceDate).
+// 4. It deduplicates commits by hash to avoid double-counting rebased, cherry-picked, or multi-branch commits.
+func fillCommits(repoPath string, emailSet map[string]struct{}, maxDays int, now time.Time, seenCommits *sync.Map) (map[int]int, int, error) {
+	localCommits := make(map[int]int)
+
+	repo, err := git.PlainOpen(repoPath)
 	if err != nil {
-		fmt.Printf("Skipping %s: %v\n", path, err)
-		return commits
+		return nil, 0, fmt.Errorf("failed to open repo %s: %w", repoPath, err)
 	}
 
 	ref, err := repo.Head()
 	if err != nil {
-		fmt.Printf("Skipping %s: %v\n", path, err)
-		return commits
+		// Empty repo or detached without head is not fatal
+		return localCommits, 0, nil
 	}
 
 	iterator, err := repo.Log(&git.LogOptions{From: ref.Hash()})
 	if err != nil {
-		fmt.Printf("Skipping %s: %v\n", path, err)
-		return commits
+		return nil, 0, fmt.Errorf("failed to get commit log for %s: %w", repoPath, err)
 	}
+	defer iterator.Close()
 
-	offset := calcOffset()
+	offset := calcOffset(now)
+	totalMatched := 0
+
 	err = iterator.ForEach(func(c *object.Commit) error {
-		if c.Author.Email != email {
+		// Deduplicate commits by hash across branches/repos if seenCommits is provided
+		if seenCommits != nil {
+			if _, loaded := seenCommits.LoadOrStore(c.Hash, struct{}{}); loaded {
+				return nil
+			}
+		}
+
+		authorEmail := strings.ToLower(strings.TrimSpace(c.Author.Email))
+		if _, matches := emailSet[authorEmail]; !matches {
 			return nil
 		}
-		days := countDaysSinceDate(c.Author.When)
 
+		// O(1) DST-safe calendar difference
+		days := countDaysSinceDate(c.Author.When, now, maxDays)
 		if days == outofRange {
 			return nil
 		}
 
 		days += offset
-		commits[days]++
+		localCommits[days]++
+		totalMatched++
 		return nil
 	})
+
 	if err != nil {
-		panic(err)
+		// Non-fatal error: some commits in history may be unreadable, but we return whatever was gathered
+		return localCommits, totalMatched, fmt.Errorf("warning during iteration of %s: %w", repoPath, err)
 	}
 
-	return commits
+	return localCommits, totalMatched, nil
 }
 
-// given the email give the commits of last 6 months
-func processRepositories(email string) map[int]int {
+// processRepositoriesSequential processes all repos sequentially (single-threaded baseline).
+func processRepositoriesSequential(emailStr string, repos []string, maxDays int, now time.Time) map[int]int {
+	emailSet := parseEmails(emailStr)
+	totalCommits := make(map[int]int, maxDays)
+	for i := maxDays; i > 0; i-- {
+		totalCommits[i] = 0
+	}
+
+	var seenCommits sync.Map
+
+	for _, path := range repos {
+		localMap, _, err := fillCommits(path, emailSet, maxDays, now, &seenCommits)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Notice: %v\n", err)
+		}
+		for day, count := range localMap {
+			totalCommits[day] += count
+		}
+	}
+
+	return totalCommits
+}
+
+// processRepositoriesConcurrent processes all repositories concurrently using a worker pool.
+// Why this architecture?
+// 1. Git packfile decompression and commit log walking are CPU- and I/O-intensive.
+//    Running per-repo in parallel yields near-linear speedups on multi-core machines.
+// 2. Each worker maintains its OWN thread-local map. No shared map mutations happen,
+//    eliminating any possibility of Go's `fatal error: concurrent map writes` without
+//    any mutex contention!
+// 3. Results are aggregated deterministically by the collector.
+func processRepositoriesConcurrent(emailStr string, repos []string, maxDays int, workers int, now time.Time) map[int]int {
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	if workers > len(repos) && len(repos) > 0 {
+		workers = len(repos)
+	}
+
+	emailSet := parseEmails(emailStr)
+	totalCommits := make(map[int]int, maxDays)
+	for i := maxDays; i > 0; i-- {
+		totalCommits[i] = 0
+	}
+
+	if len(repos) == 0 {
+		return totalCommits
+	}
+
+	jobs := make(chan string, len(repos))
+	results := make(chan RepoResult, len(repos))
+	var seenCommits sync.Map
+	var wg sync.WaitGroup
+
+	// Launch worker pool
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				localMap, total, err := fillCommits(path, emailSet, maxDays, now, &seenCommits)
+				results <- RepoResult{
+					RepoPath: path,
+					Commits:  localMap,
+					Total:    total,
+					Err:      err,
+				}
+			}
+		}()
+	}
+
+	// Feed jobs
+	for _, path := range repos {
+		jobs <- path
+	}
+	close(jobs)
+
+	// Close results channel once all workers finish
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collector merges results safely into master commits map
+	for res := range results {
+		if res.Err != nil {
+			fmt.Fprintf(os.Stderr, "Notice: %v\n", res.Err)
+		}
+		for day, count := range res.Commits {
+			totalCommits[day] += count
+		}
+	}
+
+	return totalCommits
+}
+
+// stats is the standard entry point for CLI visualization.
+func stats(emailStr string, workers int) {
 	filePath := getDotFilePath()
 	repos := parseFileToSlice(filePath)
 
-	daysInMap := daysInLastSixMonths
-
-	commits := make(map[int]int, daysInMap)
-	for i := daysInMap; i > 0; i-- {
-		commits[i] = 0
-	}
-
-	for _, path := range repos {
-		fmt.Println("Opening:", path)
-
-		commits = fillCommits(email, path, commits)
-	}
-
-	return commits
-}
-
-// determines and returns the amount of days missing to fill last row of the stats groph
-func calcOffset() int {
-	var offset int
-	weekdays := time.Now().Weekday()
-
-	switch weekdays {
-	case time.Sunday:
-		offset = 7
-	case time.Monday:
-		offset = 6
-	case time.Tuesday:
-		offset = 5
-	case time.Wednesday:
-		offset = 4
-	case time.Thursday:
-		offset = 3
-	case time.Friday:
-		offset = 2
-	case time.Saturday:
-		offset = 1
-	}
-
-	return offset
-}
-
-// given a cell value prints it with a different format
-// based on the value amoutn , and on the 'today' flag
-func printCell(val int, today bool) {
-	escape := "\033[0;37;30m"
-	switch {
-	case val > 0 && val < 5:
-		escape = "\033[1;30;47m"
-	case val >= 5 && val < 10:
-		escape = "\033[1;30;43m"
-	case val >= 10:
-		escape = "\033[1;30;42m"
-	}
-
-	if today {
-		escape = "\033[1;37;45m"
-	}
-
-	if val == 0 {
-		fmt.Printf(escape + "  - " + "\033[0m")
+	if len(repos) == 0 {
+		fmt.Printf("No Git repositories configured in %s.\nUse -add <directory> to register repositories.\n", filePath)
 		return
 	}
 
-	str := "  %d "
-	switch {
-	case val >= 10:
-		str = " %d "
-	case val >= 100:
-		str = "%d "
+	fmt.Printf("Analyzing %d repositories using %d concurrent worker(s) for [%s]...\n", len(repos), workers, emailStr)
+	start := time.Now()
+	commits := processRepositoriesConcurrent(emailStr, repos, daysInLastSixMonths, workers, time.Now())
+	duration := time.Since(start)
+
+	totalCount := 0
+	for _, c := range commits {
+		totalCount += c
 	}
 
-	fmt.Printf(escape+str+"\033[0m", val)
-}
-
-// prints commit stats
-func printCommitStats(commits map[int]int) {
-	keys := sortMapIntoSlice(commits)
-	cols := buildCols(keys, commits)
-	printCells(cols)
-}
-
-// returns a slice of indexes of a map , ordered
-func sortMapIntoSlice(m map[int]int) []int {
-	var keys []int
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Ints(keys)
-
-	return keys
-}
-
-// generates a map with rows and columns ready to be printed to screen
-func buildCols(keys []int, commits map[int]int) map[int]column {
-	cols := make(map[int]column)
-	col := column{}
-
-	for _, k := range keys {
-		week := int(k / 7) //26,25...1
-		dayinweek := k % 7 // 0,1,2,3,4,5,6
-
-		if dayinweek == 0 { //reset
-			col = column{}
-		}
-
-		col = append(col, commits[k])
-
-		if dayinweek == 6 {
-			cols[week] = col
-		}
-	}
-
-	return cols
-}
-
-// print cells of the graph
-func printCells(cols map[int]column) {
-	printMonths()
-	for j := 6; j >= 0; j-- {
-		for i := weeksInLastSixMonths + 1; i >= 0; i-- {
-			if i == weeksInLastSixMonths+1 {
-				printDayCol(j)
-			}
-			if col, ok := cols[i]; ok {
-				//special case today
-				if i == 0 && j == calcOffset()-1 {
-					printCell(col[j], true)
-					continue
-				} else {
-					if len(col) > j {
-						printCell(col[j], false)
-						continue
-					}
-				}
-			}
-			printCell(0, false)
-		}
-		fmt.Printf("\n")
-	}
-}
-
-// prints the month name in first line
-func printMonths() {
-	week := getBeginningOfTheDay(time.Now()).Add(-(daysInLastSixMonths * time.Hour * 24))
-	month := week.Month()
-	fmt.Printf("	")
-	for {
-		if week.Month() != month {
-			fmt.Printf("%s ", week.Month().String()[:3])
-			month = week.Month()
-		} else {
-			fmt.Printf("    ")
-		}
-
-		week = week.Add(7 * time.Hour * 24)
-		if week.After(time.Now()) {
-			break
-		}
-	}
-	fmt.Printf("\n")
-}
-
-// given the day number print the day name
-func printDayCol(day int) {
-	out := "	"
-	switch day {
-	case 0:
-		out = " Sun "
-	case 1:
-		out = " Mon "
-	case 2:
-		out = " Tue "
-	case 3:
-		out = " Wed "
-	case 4:
-		out = " Thu "
-	case 5:
-		out = " Fri "
-	case 6:
-		out = " Sat "
-	}
-
-	fmt.Printf(out)
+	fmt.Printf("Completed in %v | Total commits in last 6 months: %d\n\n", duration, totalCount)
+	printCommitStats(commits)
 }
