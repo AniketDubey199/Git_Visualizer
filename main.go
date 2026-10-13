@@ -55,7 +55,7 @@ func main() {
 	}
 
 	if folder != "" {
-		scan(folder)
+		scan(folder, workers)
 		return
 	}
 

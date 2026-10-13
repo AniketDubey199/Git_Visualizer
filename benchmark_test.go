@@ -100,3 +100,30 @@ func BenchmarkProcessRepositoriesConcurrent_8Workers(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkScanGitFolderSequential(b *testing.B) {
+	repos, _ := setupMockRepos(b, 16, 2)
+	rootDir := filepath.Dir(repos[0])
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		visited := make(map[string]bool)
+		found := scanGitFolderSequential(rootDir, visited)
+		if len(found) != 16 {
+			b.Fatalf("expected 16 repos, got %d", len(found))
+		}
+	}
+}
+
+func BenchmarkScanGitFolderConcurrent_4Workers(b *testing.B) {
+	repos, _ := setupMockRepos(b, 16, 2)
+	rootDir := filepath.Dir(repos[0])
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		found := scanGitFolderConcurrent(rootDir, 4)
+		if len(found) != 16 {
+			b.Fatalf("expected 16 repos, got %d", len(found))
+		}
+	}
+}

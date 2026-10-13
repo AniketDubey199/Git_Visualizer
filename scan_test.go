@@ -61,11 +61,16 @@ func TestScanGitFolder_SymlinkCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Run crawler - must complete cleanly without infinite recursion
+	// Run sequential crawler
 	visited := make(map[string]bool)
-	repos := scanGitFolder(dirA, visited)
+	reposSeq := scanGitFolderSequential(dirA, visited)
+	if len(reposSeq) != 1 {
+		t.Fatalf("Expected 1 repo discovered sequentially despite symlink cycle, got %d", len(reposSeq))
+	}
 
-	if len(repos) != 1 {
-		t.Fatalf("Expected 1 repo discovered despite symlink cycle, got %d", len(repos))
+	// Run concurrent crawler with worker pool, channels and WaitGroup
+	reposConc := scanGitFolderConcurrent(dirA, 4)
+	if len(reposConc) != 1 {
+		t.Fatalf("Expected 1 repo discovered concurrently despite symlink cycle, got %d", len(reposConc))
 	}
 }
